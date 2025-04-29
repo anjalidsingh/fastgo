@@ -2,6 +2,7 @@ import { initializeApp } from "firebase/app";
 import { getFirestore, enableIndexedDbPersistence, enableMultiTabIndexedDbPersistence } from "firebase/firestore";
 import { getAuth, setPersistence, browserLocalPersistence } from "firebase/auth";
 import { getAnalytics, logEvent } from "firebase/analytics";
+import { getDatabase } from "firebase/database";
 
 const firebaseConfig = {
   apiKey: "AIzaSyAvWSfxED9AuoXpqw_06gSWJ8FJsV0s7N4",
@@ -19,6 +20,7 @@ const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 const auth = getAuth(app);
 const analytics = getAnalytics(app);
+const rtdb = getDatabase(app); // Initialize Realtime Database
 
 // Enable authentication persistence
 setPersistence(auth, browserLocalPersistence)
@@ -65,4 +67,4 @@ const firestoreSettings = {
   cacheSizeBytes: 50 * 1024 * 1024, // 50 MB
 };
 
-export { app, db, auth, analytics, firestoreSettings };
+export { app, db, auth, analytics, rtdb, firestoreSettings };
