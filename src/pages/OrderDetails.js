@@ -4,7 +4,6 @@ import { db } from '../services/firebase';
 import { doc, getDoc, updateDoc, onSnapshot, collection, addDoc, serverTimestamp, Timestamp } from 'firebase/firestore';
 import { useAuth } from '../context/AuthContext';
 import LoadingSpinner from '../components/LoadingSpinner';
-import MapTracking from '../components/MapTracking'; // Import MapTracking component
 
 function OrderDetails() {
   const { orderId } = useParams();
@@ -28,9 +27,6 @@ function OrderDetails() {
   const [rating, setRating] = useState(0);
   const [ratingSubmitted, setRatingSubmitted] = useState(false);
   const [ratingComment, setRatingComment] = useState('');
-  
-  // Map tracking
-  const [enableSimulation, setEnableSimulation] = useState(false);
   
   // Generate a random OTP code (6 digits)
   const generateOTP = () => {
@@ -312,17 +308,6 @@ function OrderDetails() {
   const handleBackClick = () => {
     navigate(-1); // Go back to previous page
   };
-
-  // Handle distance calculation from MapTracking
-  const handleDistanceCalculated = (distance) => {
-    console.log(`Distance calculated: ${distance} km`);
-    // You can use this data to update UI or store it
-  };
-  
-  // Toggle simulation mode
-  const toggleSimulation = () => {
-    setEnableSimulation(!enableSimulation);
-  };
   
   if (loading) {
     return (
@@ -541,32 +526,6 @@ function OrderDetails() {
               <span className="text-gray">Created: <span className="font-medium">{formatDate(order.createdAt)}</span></span>
             </div>
           </div>
-          
-          {/* Map Tracking Component */}
-          {order.status !== 'pending' && (
-            <MapTracking
-              orderId={orderId}
-              pickupAddress={order.pickupAddress}
-              deliveryAddress={order.deliveryAddress}
-              partnerInfo={partner}
-              orderStatus={order.status}
-              onDistanceCalculated={handleDistanceCalculated}
-              enableSimulation={enableSimulation}
-            />
-          )}
-          
-          {/* For dev/demo purposes, add a simulation toggle */}
-          {userType === 'customer' && order.status === 'pending' && (
-            <div className="mb-4">
-              <button
-                onClick={toggleSimulation}
-                className="btn btn-outline btn-sm"
-              >
-                {enableSimulation ? 'Disable Simulation' : 'Enable Demo Simulation'}
-              </button>
-              <small className="text-gray block mt-1">For demonstration purposes</small>
-            </div>
-          )}
           
           {/* OTP section - only visible to the appropriate user */}
           {(order.deliveryOtp || order.status === 'in-transit') && (
