@@ -160,10 +160,13 @@ const Map = ({
   
   // Use ResizeObserver to handle container size changes
   useEffect(() => {
-    if (!mapInstanceRef.current || !mapRef.current) return;
+    if (!mapRef.current) return;
     
     const resizeObserver = new ResizeObserver(() => {
-      mapInstanceRef.current.invalidateSize();
+      // Add null check to prevent errors when the map is unmounted
+      if (mapInstanceRef.current) {
+        mapInstanceRef.current.invalidateSize();
+      }
     });
     
     resizeObserver.observe(mapRef.current);
