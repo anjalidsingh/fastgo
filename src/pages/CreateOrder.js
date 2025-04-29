@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { db } from '../services/firebase';
@@ -10,11 +10,19 @@ import {
   query, 
   where, 
   orderBy, 
-  limit 
+  limit,
+  doc,
+  getDoc
 } from 'firebase/firestore';
-import PaymentMethod from '../components/PaymentMethod'; // Import the payment component
+import PaymentMethod from '../components/PaymentMethod';
+import { geocodeAddress, calculateDistance } from '../services/mapService';
+import LoadingSpinner from '../components/LoadingSpinner';
 
 function CreateOrder() {
+  // Multi-step form tracking
+  const [step, setStep] = useState(1);
+  const [totalSteps, setTotalSteps] = useState(4);
+  
   // Basic order details
   const [pickupAddress, setPickupAddress] = useState('');
   const [deliveryAddress, setDeliveryAddress] = useState('');
@@ -37,30 +45,76 @@ function CreateOrder() {
   const [additionalInstructions, setAdditionalInstructions] = useState('');
   
   // Payment method
-  const [paymentMethod, setPaymentMethod] = useState('cod'); // Default to Cash on Delivery
+  const [paymentMethod, setPaymentMethod] = useState('cod');
+  
+  // Location information
+  const [pickupCoords, setPickupCoords] = useState(null);
+  const [deliveryCoords, setDeliveryCoords] = useState(null);
+  const [estimatedDistance, setEstimatedDistance] = useState(null);
+  const [estimatedDuration, setEstimatedDuration] = useState(null);
+  
+  // Partner suggestion
+  const [suggestedPartners, setSuggestedPartners] = useState([]);
+  const [selectedPartner, setSelectedPartner] = useState(null);
+  
+  // Saved addresses
+  const [savedAddresses, setSavedAddresses] = useState([]);
+  const [useSavedPickupAddress, setUseSavedPickupAddress] = useState(false);
+  const [selectedSavedPickupAddress, setSelectedSavedPickupAddress] = useState('');
   
   // UI state
   const [loading, setLoading] = useState(false);
+  const [geocodingLoading, setGeocodingLoading] = useState(false);
   const [error, setError] = useState('');
+  const [fieldErrors, setFieldErrors] = useState({});
   const [price, setPrice] = useState(0);
   const [baseFare, setBaseFare] = useState(0);
   const [weightCharge, setWeightCharge] = useState(0);
   const [distanceCharge, setDistanceCharge] = useState(0);
   const [expressCharge, setExpressCharge] = useState(0);
-  const [step, setStep] = useState(1); // For multi-step form
   
   const { currentUser } = useAuth();
   const navigate = useNavigate();
   
-  // Generate OTP for delivery verification
-  const generateOTP = () => {
-    // Generate a 6-digit OTP
-    return Math.floor(100000 + Math.random() * 900000).toString();
-  };
+  // Initialize form - fetch user data, addresses and set defaults
+  useEffect(() => {
+    const fetchUserData = async () => {
+      if (!currentUser) return;
+      
+      try {
+        const userDoc = await getDoc(doc(db, 'users', currentUser.uid));
+        
+        if (userDoc.exists()) {
+          const userData = userDoc.data();
+          
+          // Pre-fill recipient name with user's name
+          if (userData.name && !recipientName) {
+            setRecipientName(userData.name);
+          }
+          
+          // Pre-fill recipient phone with user's phone
+          if (userData.phone && !recipientPhone) {
+            setRecipientPhone(userData.phone);
+          }
+          
+          // Get saved addresses
+          if (userData.savedAddresses && userData.savedAddresses.length > 0) {
+            setSavedAddresses(userData.savedAddresses);
+          }
+        }
+      } catch (error) {
+        console.error("Error fetching user data:", error);
+      }
+    };
+    
+    fetchUserData();
+  }, [currentUser, recipientName, recipientPhone]);
   
-  // Fetch recent addresses
+  // Fetch recent delivery addresses
   useEffect(() => {
     const fetchRecentAddresses = async () => {
+      if (!currentUser) return;
+      
       try {
         const ordersQuery = query(
           collection(db, 'orders'),
@@ -90,22 +144,104 @@ function CreateOrder() {
       }
     };
     
-    if (currentUser) {
-      fetchRecentAddresses();
-    }
+    fetchRecentAddresses();
   }, [currentUser]);
   
-  // Calculate distance between two addresses (mock implementation)
-  const calculateDistance = (pickup, delivery) => {
-    // In a real app, you would use a maps API to calculate real distance
-    // This is just a simple mock implementation
-    
-    // Generate a random distance between 2 and 15 km
-    return Math.floor(Math.random() * 13) + 2;
+  // Generate a unique OTP for delivery verification
+  const generateOTP = () => {
+    return Math.floor(100000 + Math.random() * 900000).toString();
   };
   
-  // Calculate price based on package details
-  const calculatePrice = () => {
+  // Validate addresses and get geocoordinates
+  const validateAddresses = useCallback(async () => {
+    if (!pickupAddress.trim() || !deliveryAddress.trim()) {
+      setFieldErrors(prev => ({
+        ...prev,
+        pickupAddress: !pickupAddress.trim() ? 'Pickup address is required' : undefined,
+        deliveryAddress: !deliveryAddress.trim() ? 'Delivery address is required' : undefined
+      }));
+      return false;
+    }
+    
+    try {
+      setGeocodingLoading(true);
+      
+      // Geocode both addresses
+      const pickupCoordsResult = await geocodeAddress(pickupAddress);
+      const deliveryCoordsResult = await geocodeAddress(deliveryAddress);
+      
+      setPickupCoords(pickupCoordsResult);
+      setDeliveryCoords(deliveryCoordsResult);
+      
+      // Calculate distance between addresses
+      const distance = calculateDistance(
+        pickupCoordsResult[0], 
+        pickupCoordsResult[1], 
+        deliveryCoordsResult[0], 
+        deliveryCoordsResult[1]
+      );
+      
+      setEstimatedDistance(distance);
+      
+      // Estimate delivery duration (assume 20 km/h average speed in city)
+      const durationMinutes = Math.round((distance / 20) * 60);
+      setEstimatedDuration(durationMinutes);
+      
+      setGeocodingLoading(false);
+      return true;
+    } catch (error) {
+      console.error('Error geocoding addresses:', error);
+      setGeocodingLoading(false);
+      setError('Unable to validate addresses. Please check and try again.');
+      return false;
+    }
+  }, [pickupAddress, deliveryAddress]);
+  
+  // Find available partners near pickup location
+  const findAvailablePartners = useCallback(async () => {
+    if (!pickupCoords) return;
+    
+    try {
+      // In a real app, you would query partners by location
+      // Here we'll simulate with mock data
+      const mockPartners = [
+        {
+          id: 'partner1',
+          name: 'Rahul S.',
+          rating: 4.8,
+          distance: Math.round(Math.random() * 3 + 1),
+          vehicle: 'scooter',
+          completedOrders: 127,
+          image: 'https://api.dicebear.com/7.x/micah/svg?seed=partner1'
+        },
+        {
+          id: 'partner2',
+          name: 'Priya M.',
+          rating: 4.9,
+          distance: Math.round(Math.random() * 3 + 2),
+          vehicle: 'bike',
+          completedOrders: 89,
+          image: 'https://api.dicebear.com/7.x/micah/svg?seed=partner2'
+        },
+        {
+          id: 'partner3',
+          name: 'Vikram J.',
+          rating: 4.7,
+          distance: Math.round(Math.random() * 4 + 2),
+          vehicle: 'scooter',
+          completedOrders: 215,
+          image: 'https://api.dicebear.com/7.x/micah/svg?seed=partner3'
+        }
+      ];
+      
+      setSuggestedPartners(mockPartners);
+    } catch (error) {
+      console.error('Error finding available partners:', error);
+    }
+  }, [pickupCoords]);
+  
+  // Calculate price based on package and delivery details
+  const calculatePrice = useCallback(() => {
     // Base price by size
     let basePrice;
     switch (packageSize) {
@@ -128,11 +264,14 @@ function CreateOrder() {
     const weightPrice = weightFactor * 10;
     setWeightCharge(weightPrice);
     
-    // Distance charge (if addresses are provided)
+    // Distance charge (if we have estimated distance)
     let distancePrice = 0;
-    if (pickupAddress && deliveryAddress) {
-      const distance = calculateDistance(pickupAddress, deliveryAddress);
-      distancePrice = distance * 5; // ₹5 per km
+    if (estimatedDistance) {
+      distancePrice = estimatedDistance * 5; // ₹5 per km
+    } else if (pickupAddress && deliveryAddress) {
+      // Fallback to estimate if geocoding failed
+      const distance = Math.floor(Math.random() * 13) + 2; // Random 2-15 km
+      distancePrice = distance * 5;
     }
     setDistanceCharge(distancePrice);
     
@@ -159,14 +298,10 @@ function CreateOrder() {
     }
     
     return Math.ceil(finalPrice);
-  };
-  
-  // Update price when form values change
-  useEffect(() => {
-    setPrice(calculatePrice());
   }, [
     packageSize, 
     packageWeight, 
+    estimatedDistance, 
     pickupAddress, 
     deliveryAddress, 
     isExpress,
@@ -175,89 +310,190 @@ function CreateOrder() {
     isScheduledDelivery
   ]);
   
+  // Update price whenever relevant form values change
+  useEffect(() => {
+    setPrice(calculatePrice());
+  }, [
+    calculatePrice
+  ]);
+  
+  // Get partners near pickup location when coords change
+  useEffect(() => {
+    if (pickupCoords) {
+      findAvailablePartners();
+    }
+  }, [pickupCoords, findAvailablePartners]);
+  
+  // Handle selecting a saved pickup address
+  const handleSelectSavedPickupAddress = (e) => {
+    const addressId = e.target.value;
+    
+    if (!addressId) {
+      setUseSavedPickupAddress(false);
+      setPickupAddress('');
+      return;
+    }
+    
+    const selectedAddress = savedAddresses.find(addr => addr.id === addressId);
+    if (selectedAddress) {
+      setPickupAddress(selectedAddress.address);
+      setSelectedSavedPickupAddress(addressId);
+    }
+  };
+  
   // Handle selecting a recent address
   const handleSelectRecentAddress = (e) => {
     const selectedId = e.target.value;
     setSelectedRecentAddress(selectedId);
     
-    if (selectedId) {
-      const selected = recentAddresses.find(addr => addr.id === selectedId);
-      if (selected) {
-        setDeliveryAddress(selected.address);
-        setRecipientName(selected.recipientName);
-        setRecipientPhone(selected.recipientPhone);
-      }
+    if (!selectedId) {
+      setDeliveryAddress('');
+      return;
+    }
+    
+    const selected = recentAddresses.find(addr => addr.id === selectedId);
+    if (selected) {
+      setDeliveryAddress(selected.address);
+      setRecipientName(selected.recipientName || recipientName);
+      setRecipientPhone(selected.recipientPhone || recipientPhone);
     }
   };
-
-  const validateForm = () => {
-    // Basic validation
-    if (!pickupAddress.trim()) {
-      setError('Pickup address is required');
-      return false;
+  
+  // Field validation
+  const validateField = (field, value) => {
+    let error = '';
+    
+    switch (field) {
+      case 'pickupAddress':
+        if (!value.trim()) error = 'Pickup address is required';
+        break;
+        
+      case 'deliveryAddress':
+        if (!value.trim()) error = 'Delivery address is required';
+        break;
+        
+      case 'packageWeight':
+        const weight = parseFloat(value);
+        if (isNaN(weight) || weight <= 0) {
+          error = 'Please enter a valid weight';
+        } else if (
+          (packageSize === 'small' && weight > 5) ||
+          (packageSize === 'medium' && weight > 15) ||
+          (packageSize === 'large' && weight > 25)
+        ) {
+          error = `Maximum weight for ${packageSize} package is ${packageSize === 'small' ? 5 : packageSize === 'medium' ? 15 : 25}kg`;
+        }
+        break;
+        
+      case 'packageDescription':
+        if (!value.trim()) error = 'Please describe your package';
+        break;
+        
+      case 'recipientName':
+        if (!value.trim()) error = 'Recipient name is required';
+        break;
+        
+      case 'recipientPhone':
+        const phoneRegex = /^\d{10}$/;
+        if (!value.trim()) {
+          error = 'Recipient phone is required';
+        } else if (!phoneRegex.test(value.replace(/\D/g, ''))) {
+          error = 'Please enter a valid 10-digit phone number';
+        }
+        break;
+        
+      case 'scheduledDate':
+        if (isScheduledDelivery && !value) {
+          error = 'Please select a delivery date';
+        }
+        break;
+        
+      case 'scheduledTime':
+        if (isScheduledDelivery && !value) {
+          error = 'Please select a delivery time';
+        } else if (isScheduledDelivery) {
+          const scheduledDateTime = new Date(`${scheduledDate}T${value}`);
+          if (scheduledDateTime <= new Date()) {
+            error = 'Scheduled delivery time must be in the future';
+          }
+        }
+        break;
+        
+      default:
+        break;
     }
     
-    if (!deliveryAddress.trim()) {
-      setError('Delivery address is required');
-      return false;
-    }
+    setFieldErrors(prev => ({
+      ...prev,
+      [field]: error || undefined
+    }));
     
-    if (!packageDescription.trim()) {
-      setError('Package description is required');
-      return false;
-    }
-    
-    if (!recipientName.trim()) {
-      setError('Recipient name is required');
-      return false;
-    }
-    
-    if (!recipientPhone.trim()) {
-      setError('Recipient phone is required');
-      return false;
-    }
-    
-    // Validate phone number format
-    const phoneRegex = /^\d{10}$/;
-    if (!phoneRegex.test(recipientPhone.replace(/\D/g, ''))) {
-      setError('Please enter a valid 10-digit phone number');
-      return false;
-    }
-    
-    // Validate weight
-    const weight = parseFloat(packageWeight);
-    if (isNaN(weight) || weight <= 0) {
-      setError('Please enter a valid package weight');
-      return false;
-    }
-    
-    // Validate scheduled delivery
-    if (isScheduledDelivery) {
-      if (!scheduledDate) {
-        setError('Please select a delivery date');
-        return false;
-      }
-      
-      if (!scheduledTime) {
-        setError('Please select a delivery time');
-        return false;
-      }
-      
-      // Check if scheduled time is in the future
-      const scheduledDateTime = new Date(`${scheduledDate}T${scheduledTime}`);
-      if (scheduledDateTime <= new Date()) {
-        setError('Scheduled delivery time must be in the future');
-        return false;
-      }
-    }
-    
-    return true;
+    return !error;
   };
-
+  
+  // Handle field blur (for validation)
+  const handleBlur = (field, value) => {
+    validateField(field, value);
+  };
+  
+  // Validate current step
+  const validateStep = () => {
+    let isValid = true;
+    
+    if (step === 1) {
+      isValid = validateField('pickupAddress', pickupAddress) 
+              && validateField('deliveryAddress', deliveryAddress);
+    } else if (step === 2) {
+      isValid = validateField('packageWeight', packageWeight) 
+              && validateField('packageDescription', packageDescription);
+    } else if (step === 3) {
+      isValid = validateField('recipientName', recipientName) 
+              && validateField('recipientPhone', recipientPhone);
+              
+      if (isScheduledDelivery) {
+        isValid = isValid 
+                && validateField('scheduledDate', scheduledDate) 
+                && validateField('scheduledTime', scheduledTime);
+      }
+    }
+    
+    return isValid;
+  };
+  
+  // Move to next step
+  const handleNextStep = async () => {
+    if (!validateStep()) {
+      return;
+    }
+    
+    if (step === 1) {
+      // Validate addresses with geocoding
+      const addressesValid = await validateAddresses();
+      if (!addressesValid) return;
+    }
+    
+    setStep(step + 1);
+    window.scrollTo(0, 0);
+  };
+  
+  // Move to previous step
+  const handlePrevStep = () => {
+    setStep(step - 1);
+    window.scrollTo(0, 0);
+  };
+  
+  // Get class for progress step
+  const getStepClasses = (stepNumber) => {
+    if (step > stepNumber) return "progress-step completed";
+    if (step === stepNumber) return "progress-step active";
+    return "progress-step";
+  };
+  
+  // Handle form submission
   const handleSubmit = async (e) => {
     e.preventDefault();
     
-    if (!validateForm()) {
+    if (!validateStep()) {
       return;
     }
     
@@ -299,14 +535,20 @@ function CreateOrder() {
         paymentMethod, // Add payment method
         paymentStatus: paymentMethod === 'cod' ? 'pending' : 'paid', // For COD, payment is pending until delivery
         status: 'pending', // pending, assigned, in-transit, delivered
-        partnerId: null,
+        partnerId: selectedPartner ? selectedPartner.id : null,
         rated: false, // For rating after delivery
+        // Add geocoded coordinates if available
+        pickupCoords: pickupCoords || null,
+        deliveryCoords: deliveryCoords || null,
+        estimatedDistance: estimatedDistance || null,
+        estimatedDuration: estimatedDuration || null,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp()
       };
       
       const orderRef = await addDoc(collection(db, 'orders'), orderData);
       
+      // Navigate to the order details page
       navigate(`/order/${orderRef.id}`);
     } catch (error) {
       console.error('Failed to create order:', error);
@@ -315,39 +557,14 @@ function CreateOrder() {
       setLoading(false);
     }
   };
-
-  // Move to next step
-  const handleNextStep = () => {
-    if (step === 1) {
-      // Validate first step
-      if (!pickupAddress.trim() || !deliveryAddress.trim()) {
-        setError('Please fill in both pickup and delivery addresses');
-        return;
-      }
-      setError('');
-    }
-    setStep(step + 1);
-  };
-
-  // Move to previous step
-  const handlePrevStep = () => {
-    setStep(step - 1);
-    setError('');
-  };
-
-  // Get progress step classes
-  const getStepClasses = (stepNumber) => {
-    if (step > stepNumber) return "progress-step completed";
-    if (step === stepNumber) return "progress-step active";
-    return "progress-step";
-  };
-
+  
   return (
-    <div className="form-container">
+    <div className="form-container enhanced-order-form">
       <h2 className="form-title">Create Delivery Order</h2>
       
       {/* Progress indicator */}
-      <div className="progress-bar-container">
+      <div className="progress-container">
+        <div className="progress-bar" style={{ width: `${(step / totalSteps) * 100}%` }}></div>
         <div className="progress-steps" data-step={step}>
           <div className={getStepClasses(1)}>
             <div className="progress-step-number">{step > 1 ? "✓" : "1"}</div>
@@ -359,7 +576,7 @@ function CreateOrder() {
           </div>
           <div className={getStepClasses(3)}>
             <div className="progress-step-number">{step > 3 ? "✓" : "3"}</div>
-            <div className="progress-step-label">Recipient</div>
+            <div className="progress-step-label">Options</div>
           </div>
           <div className={getStepClasses(4)}>
             <div className="progress-step-number">4</div>
@@ -383,20 +600,64 @@ function CreateOrder() {
         {/* Step 1: Addresses */}
         {step === 1 && (
           <div className="form-step">
+            <div className="step-header">
+              <h3 className="step-title">Pickup & Delivery Locations</h3>
+              <p className="step-description">Enter the addresses for pickup and delivery</p>
+            </div>
+            
             <div className="form-group">
               <label className="form-label">Pickup Address</label>
-              <textarea
-                value={pickupAddress}
-                onChange={(e) => setPickupAddress(e.target.value)}
-                className="form-textarea"
-                rows="2"
-                placeholder="Enter the full pickup address"
-                required
-              ></textarea>
+              
+              {savedAddresses.length > 0 && (
+                <div className="mb-2">
+                  <label className="inline-flex items-center">
+                    <input
+                      type="checkbox"
+                      checked={useSavedPickupAddress}
+                      onChange={() => setUseSavedPickupAddress(!useSavedPickupAddress)}
+                      className="form-checkbox"
+                    />
+                    <span className="ml-2">Use a saved address</span>
+                  </label>
+                </div>
+              )}
+              
+              {useSavedPickupAddress && savedAddresses.length > 0 ? (
+                <div className="form-group">
+                  <select
+                    value={selectedSavedPickupAddress}
+                    onChange={handleSelectSavedPickupAddress}
+                    className={`form-select ${fieldErrors.pickupAddress ? 'error' : ''}`}
+                    required
+                  >
+                    <option value="">Select a saved address</option>
+                    {savedAddresses.map(addr => (
+                      <option key={addr.id} value={addr.id}>
+                        {addr.name}: {addr.address.substring(0, 40)}...
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : (
+                <textarea
+                  value={pickupAddress}
+                  onChange={(e) => setPickupAddress(e.target.value)}
+                  onBlur={() => handleBlur('pickupAddress', pickupAddress)}
+                  className={`form-textarea ${fieldErrors.pickupAddress ? 'error' : ''}`}
+                  rows="2"
+                  placeholder="Enter the full pickup address"
+                  required
+                ></textarea>
+              )}
+              
+              {fieldErrors.pickupAddress && (
+                <div className="field-error">{fieldErrors.pickupAddress}</div>
+              )}
             </div>
             
             <div className="form-group">
               <label className="form-label">Delivery Address</label>
+              
               {recentAddresses.length > 0 && (
                 <div className="mb-2">
                   <label className="inline-flex items-center">
@@ -416,7 +677,7 @@ function CreateOrder() {
                   <select
                     value={selectedRecentAddress}
                     onChange={handleSelectRecentAddress}
-                    className="form-select"
+                    className={`form-select ${fieldErrors.deliveryAddress ? 'error' : ''}`}
                     required
                   >
                     <option value="">Select a recent address</option>
@@ -431,25 +692,58 @@ function CreateOrder() {
                 <textarea
                   value={deliveryAddress}
                   onChange={(e) => setDeliveryAddress(e.target.value)}
-                  className="form-textarea"
+                  onBlur={() => handleBlur('deliveryAddress', deliveryAddress)}
+                  className={`form-textarea ${fieldErrors.deliveryAddress ? 'error' : ''}`}
                   rows="2"
                   placeholder="Enter the full delivery address"
                   required
                 ></textarea>
               )}
+              
+              {fieldErrors.deliveryAddress && (
+                <div className="field-error">{fieldErrors.deliveryAddress}</div>
+              )}
             </div>
+            
+            {/* Show distance estimation if available */}
+            {estimatedDistance && (
+              <div className="distance-info">
+                <div className="distance-icon">
+                  <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon>
+                  </svg>
+                </div>
+                <div className="distance-details">
+                  <div className="distance-text">Estimated distance: <strong>{estimatedDistance} km</strong></div>
+                  {estimatedDuration && (
+                    <div className="duration-text">Estimated delivery time: <strong>{estimatedDuration} min</strong></div>
+                  )}
+                </div>
+              </div>
+            )}
             
             <div className="form-navigation">
               <button 
                 type="button" 
                 onClick={handleNextStep}
+                disabled={geocodingLoading}
                 className="btn btn-full"
               >
-                <span>Next</span>
-                <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" className="ml-2">
-                  <line x1="5" y1="12" x2="19" y2="12"></line>
-                  <polyline points="12 5 19 12 12 19"></polyline>
-                </svg>
+                {geocodingLoading ? (
+                  <span>
+                    <LoadingSpinner size="small" />
+                    Validating Addresses...
+                  </span>
+                ) : (
+                  <span>
+                    Next
+                    <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" className="ml-2">
+                      <line x1="5" y1="12" x2="19" y2="12"></line>
+                      <polyline points="12 5 19 12 12 19"></polyline>
+                    </svg>
+                  </span>
+                )}
               </button>
             </div>
           </div>
@@ -458,6 +752,11 @@ function CreateOrder() {
         {/* Step 2: Package Details */}
         {step === 2 && (
           <div className="form-step">
+            <div className="step-header">
+              <h3 className="step-title">Package Details</h3>
+              <p className="step-description">Tell us about what you're sending</p>
+            </div>
+            
             <div className="form-group">
               <label className="form-label">Package Size</label>
               <div className="package-size-selector">
@@ -502,9 +801,13 @@ function CreateOrder() {
                 step="0.1"
                 value={packageWeight}
                 onChange={(e) => setPackageWeight(e.target.value)}
-                className="form-input"
+                onBlur={() => handleBlur('packageWeight', packageWeight)}
+                className={`form-input ${fieldErrors.packageWeight ? 'error' : ''}`}
                 required
               />
+              {fieldErrors.packageWeight && (
+                <div className="field-error">{fieldErrors.packageWeight}</div>
+              )}
             </div>
             
             <div className="form-group">
@@ -512,11 +815,15 @@ function CreateOrder() {
               <textarea
                 value={packageDescription}
                 onChange={(e) => setPackageDescription(e.target.value)}
-                className="form-textarea"
+                onBlur={() => handleBlur('packageDescription', packageDescription)}
+                className={`form-textarea ${fieldErrors.packageDescription ? 'error' : ''}`}
                 rows="2"
                 placeholder="Describe what you're sending"
                 required
               ></textarea>
+              {fieldErrors.packageDescription && (
+                <div className="field-error">{fieldErrors.packageDescription}</div>
+              )}
             </div>
             
             <div className="form-group">
@@ -531,6 +838,16 @@ function CreateOrder() {
                 />
                 <label htmlFor="foodDelivery" className="ml-2">Food Delivery (requires special handling)</label>
               </div>
+              {isFoodDelivery && (
+                <div className="food-delivery-notice">
+                  <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                    <line x1="12" y1="9" x2="12" y2="13"></line>
+                    <line x1="12" y1="17" x2="12.01" y2="17"></line>
+                  </svg>
+                  <span>Food deliveries are handled with priority and special care. Additional fee of ₹20 applies.</span>
+                </div>
+              )}
             </div>
             
             <div className="form-navigation">
@@ -560,19 +877,28 @@ function CreateOrder() {
           </div>
         )}
         
-        {/* Step 3: Recipient Details */}
+        {/* Step 3: Delivery Options */}
         {step === 3 && (
           <div className="form-step">
+            <div className="step-header">
+              <h3 className="step-title">Delivery Options & Recipient</h3>
+              <p className="step-description">Select delivery options and provide recipient details</p>
+            </div>
+            
             <div className="form-group">
               <label className="form-label">Recipient Name</label>
               <input
                 type="text"
                 value={recipientName}
                 onChange={(e) => setRecipientName(e.target.value)}
-                className="form-input"
+                onBlur={() => handleBlur('recipientName', recipientName)}
+                className={`form-input ${fieldErrors.recipientName ? 'error' : ''}`}
                 placeholder="Full name of recipient"
                 required
               />
+              {fieldErrors.recipientName && (
+                <div className="field-error">{fieldErrors.recipientName}</div>
+              )}
             </div>
             
             <div className="form-group">
@@ -581,54 +907,17 @@ function CreateOrder() {
                 type="tel"
                 value={recipientPhone}
                 onChange={(e) => setRecipientPhone(e.target.value)}
-                className="form-input"
+                onBlur={() => handleBlur('recipientPhone', recipientPhone)}
+                className={`form-input ${fieldErrors.recipientPhone ? 'error' : ''}`}
                 placeholder="10-digit phone number"
                 required
               />
+              {fieldErrors.recipientPhone && (
+                <div className="field-error">{fieldErrors.recipientPhone}</div>
+              )}
               <small className="form-hint">This number will be used to contact the recipient for delivery</small>
             </div>
             
-            <div className="form-group">
-              <label className="form-label">Additional Instructions</label>
-              <textarea
-                value={additionalInstructions}
-                onChange={(e) => setAdditionalInstructions(e.target.value)}
-                className="form-textarea"
-                rows="2"
-                placeholder="Any special instructions for the delivery partner"
-              ></textarea>
-            </div>
-            
-            <div className="form-navigation">
-              <button 
-                type="button" 
-                onClick={handlePrevStep}
-                className="btn btn-outline"
-              >
-                <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" className="mr-2">
-                  <line x1="19" y1="12" x2="5" y2="12"></line>
-                  <polyline points="12 19 5 12 12 5"></polyline>
-                </svg>
-                Back
-              </button>
-              <button 
-                type="button" 
-                onClick={handleNextStep}
-                className="btn ml-2"
-              >
-                Next
-                <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" className="ml-2">
-                  <line x1="5" y1="12" x2="19" y2="12"></line>
-                  <polyline points="12 5 19 12 12 19"></polyline>
-                </svg>
-              </button>
-            </div>
-          </div>
-        )}
-        
-        {/* Step 4: Delivery Options and Payment */}
-        {step === 4 && (
-          <div className="form-step">
             <div className="form-group">
               <label className="form-label">Delivery Options</label>
               
@@ -685,10 +974,14 @@ function CreateOrder() {
                       type="date"
                       value={scheduledDate}
                       onChange={(e) => setScheduledDate(e.target.value)}
-                      className="form-input"
+                      onBlur={() => handleBlur('scheduledDate', scheduledDate)}
+                      className={`form-input ${fieldErrors.scheduledDate ? 'error' : ''}`}
                       min={new Date().toISOString().split('T')[0]}
                       required={isScheduledDelivery}
                     />
+                    {fieldErrors.scheduledDate && (
+                      <div className="field-error">{fieldErrors.scheduledDate}</div>
+                    )}
                   </div>
                   
                   <div className="form-group">
@@ -697,19 +990,125 @@ function CreateOrder() {
                       type="time"
                       value={scheduledTime}
                       onChange={(e) => setScheduledTime(e.target.value)}
-                      className="form-input"
+                      onBlur={() => handleBlur('scheduledTime', scheduledTime)}
+                      className={`form-input ${fieldErrors.scheduledTime ? 'error' : ''}`}
                       required={isScheduledDelivery}
                     />
+                    {fieldErrors.scheduledTime && (
+                      <div className="field-error">{fieldErrors.scheduledTime}</div>
+                    )}
                   </div>
                 </div>
               )}
             </div>
             
-            {/* Add Payment Method Selection */}
+            <div className="form-group">
+              <label className="form-label">Additional Instructions</label>
+              <textarea
+                value={additionalInstructions}
+                onChange={(e) => setAdditionalInstructions(e.target.value)}
+                className="form-textarea"
+                rows="2"
+                placeholder="Any special instructions for the delivery partner"
+              ></textarea>
+            </div>
+            
+            <div className="form-navigation">
+              <button 
+                type="button" 
+                onClick={handlePrevStep}
+                className="btn btn-outline"
+              >
+                <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" className="mr-2">
+                  <line x1="19" y1="12" x2="5" y2="12"></line>
+                  <polyline points="12 19 5 12 12 5"></polyline>
+                </svg>
+                Back
+              </button>
+              <button 
+                type="button" 
+                onClick={handleNextStep}
+                className="btn ml-2"
+              >
+                Next
+                <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" className="ml-2">
+                  <line x1="5" y1="12" x2="19" y2="12"></line>
+                  <polyline points="12 5 19 12 12 19"></polyline>
+                </svg>
+              </button>
+            </div>
+          </div>
+        )}
+        
+        {/* Step 4: Payment and Confirmation */}
+        {step === 4 && (
+          <div className="form-step">
+            <div className="step-header">
+              <h3 className="step-title">Payment & Confirmation</h3>
+              <p className="step-description">Review your order and select a payment method</p>
+            </div>
+            
+            {/* Payment Method Selection */}
             <PaymentMethod 
               onPaymentMethodSelect={setPaymentMethod} 
               selectedPaymentMethod={paymentMethod}
             />
+            
+            {/* Available Partner Selection */}
+            {suggestedPartners.length > 0 && (
+              <div className="partner-selection-section">
+                <h3 className="section-title">Available Delivery Partners</h3>
+                <p className="section-subtitle">Choose a partner for your delivery or let our system auto-assign</p>
+                
+                <div className="partners-grid">
+                  {suggestedPartners.map(partner => (
+                    <div 
+                      key={partner.id} 
+                      className={`partner-card ${selectedPartner && selectedPartner.id === partner.id ? 'selected' : ''}`}
+                      onClick={() => setSelectedPartner(partner)}
+                    >
+                      <div className="partner-avatar" style={{backgroundImage: `url(${partner.image})`}}></div>
+                      <div className="partner-details">
+                        <div className="partner-name">{partner.name}</div>
+                        <div className="partner-rating">
+                          <span className="rating-value">{partner.rating}</span>
+                          <div className="rating-stars">
+                            {[1, 2, 3, 4, 5].map(star => (
+                              <span 
+                                key={star} 
+                                className={`rating-star ${star <= Math.floor(partner.rating) ? 'active' : star <= partner.rating ? 'half-active' : ''}`}
+                              >★</span>
+                            ))}
+                          </div>
+                        </div>
+                        <div className="partner-stats">
+                          <span className="partner-distance">{partner.distance} km away</span>
+                          <span className="partner-orders">{partner.completedOrders} deliveries</span>
+                        </div>
+                        <div className="partner-vehicle">
+                          <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round">
+                            <circle cx="5.5" cy="17.5" r="3.5"></circle>
+                            <circle cx="18.5" cy="17.5" r="3.5"></circle>
+                            <path d="M15 6h2a2 2 0 0 1 2 2v9.5"></path>
+                            <path d="M6 17.5V10a2 2 0 0 1 2-2h7"></path>
+                            <path d="M2.5 14h8"></path>
+                          </svg>
+                          <span className="capitalize">{partner.vehicle}</span>
+                        </div>
+                      </div>
+                      {selectedPartner && selectedPartner.id === partner.id && (
+                        <div className="selected-badge">
+                          <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+                            <polyline points="22 4 12 14.01 9 11.01"></polyline>
+                          </svg>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             
             <div className="otp-notice">
               <div className="otp-notice-icon">
@@ -725,49 +1124,109 @@ function CreateOrder() {
             
             <div className="payment-summary">
               <h4 className="payment-summary-title">Order Summary</h4>
-              <div className="payment-summary-row">
-                <span>Base Fare:</span>
-                <span>₹{baseFare}</span>
-              </div>
-              <div className="payment-summary-row">
-                <span>Weight Charge:</span>
-                <span>₹{weightCharge}</span>
-              </div>
-              {distanceCharge > 0 && (
-                <div className="payment-summary-row">
-                  <span>Distance Charge:</span>
-                  <span>₹{distanceCharge}</span>
+              
+              <div className="order-details-summary">
+                <div className="order-address-summary">
+                  <div className="address-item">
+                    <div className="address-icon pickup">
+                      <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <line x1="12" y1="8" x2="12" y2="16"></line>
+                        <line x1="8" y1="12" x2="16" y2="12"></line>
+                      </svg>
+                    </div>
+                    <div className="address-details">
+                      <div className="address-label">Pickup</div>
+                      <div className="address-text">{pickupAddress}</div>
+                    </div>
+                  </div>
+                  
+                  <div className="address-connector"></div>
+                  
+                  <div className="address-item">
+                    <div className="address-icon delivery">
+                      <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <polyline points="8 12 12 16 16 12"></polyline>
+                        <line x1="12" y1="8" x2="12" y2="16"></line>
+                      </svg>
+                    </div>
+                    <div className="address-details">
+                      <div className="address-label">Delivery</div>
+                      <div className="address-text">{deliveryAddress}</div>
+                    </div>
+                  </div>
                 </div>
-              )}
-              {isExpress && (
-                <div className="payment-summary-row">
-                  <span>Express Delivery:</span>
-                  <span>₹{expressCharge}</span>
+                
+                <div className="order-package-summary">
+                  <div className="package-size-summary">
+                    <span className="package-label">Size:</span>
+                    <span className="package-value capitalize">{packageSize}</span>
+                  </div>
+                  <div className="package-weight-summary">
+                    <span className="package-label">Weight:</span>
+                    <span className="package-value">{packageWeight} kg</span>
+                  </div>
+                  {estimatedDistance && (
+                    <div className="package-distance-summary">
+                      <span className="package-label">Distance:</span>
+                      <span className="package-value">{estimatedDistance} km</span>
+                    </div>
+                  )}
                 </div>
-              )}
-              <div className="payment-summary-row">
-                <span>Discount:</span>
-                <span className="text-success">-10%</span>
               </div>
-              {needReturnDelivery && (
+              
+              <div className="price-breakdown">
                 <div className="payment-summary-row">
-                  <span>Return Delivery Option:</span>
-                  <span>+50%</span>
+                  <span>Base Fare:</span>
+                  <span>₹{baseFare}</span>
                 </div>
-              )}
-              {isScheduledDelivery && (
                 <div className="payment-summary-row">
-                  <span>Scheduled Delivery:</span>
-                  <span>₹30</span>
+                  <span>Weight Charge:</span>
+                  <span>₹{weightCharge}</span>
                 </div>
-              )}
-              <div className="payment-summary-row total">
-                <span>Total Price:</span>
-                <span>₹{price}</span>
-              </div>
-              <div className="payment-summary-row">
-                <span>Payment Method:</span>
-                <span className="capitalize">{paymentMethod === 'cod' ? 'Cash on Delivery' : paymentMethod}</span>
+                {distanceCharge > 0 && (
+                  <div className="payment-summary-row">
+                    <span>Distance Charge:</span>
+                    <span>₹{distanceCharge}</span>
+                  </div>
+                )}
+                {isExpress && (
+                  <div className="payment-summary-row">
+                    <span>Express Delivery:</span>
+                    <span>₹{expressCharge}</span>
+                  </div>
+                )}
+                <div className="payment-summary-row discount">
+                  <span>Discount:</span>
+                  <span className="text-success">-10%</span>
+                </div>
+                {needReturnDelivery && (
+                  <div className="payment-summary-row surcharge">
+                    <span>Return Delivery Option:</span>
+                    <span>+50%</span>
+                  </div>
+                )}
+                {isScheduledDelivery && (
+                  <div className="payment-summary-row">
+                    <span>Scheduled Delivery:</span>
+                    <span>₹30</span>
+                  </div>
+                )}
+                {isFoodDelivery && (
+                  <div className="payment-summary-row">
+                    <span>Food Handling:</span>
+                    <span>₹20</span>
+                  </div>
+                )}
+                <div className="payment-summary-row total">
+                  <span>Total Price:</span>
+                  <span>₹{price}</span>
+                </div>
+                <div className="payment-summary-row">
+                  <span>Payment Method:</span>
+                  <span className="capitalize">{paymentMethod === 'cod' ? 'Cash on Delivery' : paymentMethod}</span>
+                </div>
               </div>
             </div>
             
@@ -790,7 +1249,7 @@ function CreateOrder() {
               >
                 {loading ? (
                   <span>
-                    <span className="btn-loader"></span>
+                    <LoadingSpinner size="small" />
                     Creating Order...
                   </span>
                 ) : (

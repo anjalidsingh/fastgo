@@ -1,21 +1,19 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { 
-  collection, 
-  query, 
-  where, 
-  orderBy, 
-  limit, 
-  getDocs, 
-  onSnapshot 
-} from 'firebase/firestore';
+import { collection, query, where, orderBy, limit, getDocs, onSnapshot } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { useAuth } from '../context/AuthContext';
 import LoadingSpinner from '../components/LoadingSpinner';
-import MapTracking from '../components/MapTracking'; // Import MapTracking component
+import MapTracking from '../components/MapTracking';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
+
+// Enhanced color palette
+const COLORS = ['#4f46e5', '#10b981', '#f59e0b', '#ef4444'];
+const DELIVERY_STATUS = ['pending', 'assigned', 'in-transit', 'delivered'];
 
 function Dashboard() {
   const [activeOrders, setActiveOrders] = useState([]);
+  const [filteredOrders, setFilteredOrders] = useState([]);
   const [recentOrders, setRecentOrders] = useState([]);
   const [statsData, setStatsData] = useState({
     totalOrders: 0,
@@ -28,13 +26,18 @@ function Dashboard() {
   const [selectedOrder, setSelectedOrder] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [filterStatus, setFilterStatus] = useState('all');
+  const [timeframe, setTimeframe] = useState('week');
+  const [spendingData, setSpendingData] = useState([]);
   const { currentUser } = useAuth();
   const navigate = useNavigate();
 
+  // Fetch active orders, recent orders, and statistics
   useEffect(() => {
     if (!currentUser) return;
     
-    // Set up real-time listeners for active orders (pending, assigned, in-transit)
+    // Set up real-time listeners for active orders
     const activeOrdersQuery = query(
       collection(db, 'orders'),
       where('customerId', '==', currentUser.uid),
@@ -50,9 +53,7 @@ function Dashboard() {
           ordersData.push({
             id: doc.id,
             ...data,
-            // Ensure dates are properly handled
             createdAt: data.createdAt?.toDate() || new Date(),
-            // Set default paymentStatus if not present
             paymentStatus: data.paymentStatus || 'pending'
           });
         });
@@ -96,10 +97,8 @@ function Dashboard() {
           ordersData.push({
             id: doc.id,
             ...data,
-            // Ensure dates are properly handled
             createdAt: data.createdAt?.toDate() || new Date(),
             deliveredAt: data.deliveredAt?.toDate() || new Date(),
-            // Set default paymentStatus if not present
             paymentStatus: data.paymentStatus || 'pending'
           });
         });
@@ -128,6 +127,9 @@ function Dashboard() {
           avgOrderValue: 0
         };
         
+        // Prepare spending data for chart
+        const spending = {};
+        
         querySnapshot.forEach((doc) => {
           const data = doc.data();
           stats.totalOrders++;
@@ -138,6 +140,18 @@ function Dashboard() {
             stats.inTransitOrders++;
           } else if (data.status === 'delivered') {
             stats.deliveredOrders++;
+            
+            // Calculate spending data for chart
+            if (data.deliveredAt && data.price) {
+              const deliveredDate = data.deliveredAt.toDate ? 
+                data.deliveredAt.toDate() : new Date(data.deliveredAt);
+              
+              const dateKey = deliveredDate.toISOString().split('T')[0];
+              if (!spending[dateKey]) {
+                spending[dateKey] = 0;
+              }
+              spending[dateKey] += data.price;
+            }
           }
           
           if (data.price) {
@@ -150,6 +164,16 @@ function Dashboard() {
         }
         
         setStatsData(stats);
+        
+        // Format spending data for chart
+        const spendingArray = Object.keys(spending).map(date => ({
+          date,
+          amount: spending[date]
+        })).sort((a, b) => a.date.localeCompare(b.date));
+        
+        // Get last 7 days, 30 days, or 12 months based on timeframe
+        const filteredSpending = filterSpendingByTimeframe(spendingArray, timeframe);
+        setSpendingData(filteredSpending);
       } catch (error) {
         console.error('Error fetching stats:', error);
       }
@@ -161,13 +185,81 @@ function Dashboard() {
     return () => {
       activeOrdersUnsubscribe();
     };
-  }, [currentUser, selectedOrder]);
+  }, [currentUser, selectedOrder, timeframe]);
+
+  // Filter spending data by timeframe
+  const filterSpendingByTimeframe = (data, timeframe) => {
+    const today = new Date();
+    let filtered = [];
+    
+    if (timeframe === 'week') {
+      // Last 7 days
+      const lastWeek = new Date(today);
+      lastWeek.setDate(lastWeek.getDate() - 7);
+      
+      filtered = data.filter(item => new Date(item.date) >= lastWeek);
+    } else if (timeframe === 'month') {
+      // Last 30 days
+      const lastMonth = new Date(today);
+      lastMonth.setDate(lastMonth.getDate() - 30);
+      
+      filtered = data.filter(item => new Date(item.date) >= lastMonth);
+    } else if (timeframe === 'year') {
+      // Last 12 months - grouped by month
+      const lastYear = new Date(today);
+      lastYear.setFullYear(lastYear.getFullYear() - 1);
+      
+      // Group by month
+      const monthlyData = {};
+      data.forEach(item => {
+        const date = new Date(item.date);
+        if (date >= lastYear) {
+          const monthKey = `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}`;
+          if (!monthlyData[monthKey]) {
+            monthlyData[monthKey] = 0;
+          }
+          monthlyData[monthKey] += item.amount;
+        }
+      });
+      
+      filtered = Object.keys(monthlyData).map(month => ({
+        date: month,
+        amount: monthlyData[month]
+      })).sort((a, b) => a.date.localeCompare(b.date));
+    }
+    
+    return filtered;
+  };
+
+  // Apply filters to active orders
+  useEffect(() => {
+    let result = [...activeOrders];
+    
+    // Apply search filter
+    if (searchQuery) {
+      const query = searchQuery.toLowerCase();
+      result = result.filter(order => 
+        order.id.toLowerCase().includes(query) ||
+        order.pickupAddress?.toLowerCase().includes(query) ||
+        order.deliveryAddress?.toLowerCase().includes(query) ||
+        order.recipientName?.toLowerCase().includes(query)
+      );
+    }
+    
+    // Apply status filter
+    if (filterStatus !== 'all') {
+      result = result.filter(order => order.status === filterStatus);
+    }
+    
+    setFilteredOrders(result);
+  }, [activeOrders, searchQuery, filterStatus]);
 
   // Handle selecting an order for detailed tracking
   const handleSelectOrder = (order) => {
     setSelectedOrder(order);
   };
 
+  // Format date for display
   const formatDate = (date) => {
     try {
       if (!date) return 'N/A';
@@ -179,6 +271,7 @@ function Dashboard() {
     }
   };
 
+  // Get status classes for styling
   const getStatusClass = (status) => {
     if (!status) return '';
     switch (status) {
@@ -190,15 +283,24 @@ function Dashboard() {
     }
   };
 
-  const handleOrderClick = (orderId) => {
-    navigate(`/order/${orderId}`);
-  };
-
-  // Helper function to safely capitalize the first letter
+  // Capitalize the first letter of a string
   const capitalizeFirstLetter = (string) => {
     if (!string) return 'Unknown';
     return string.charAt(0).toUpperCase() + string.slice(1);
   };
+
+  const handleOrderClick = (orderId) => {
+    navigate(`/order/${orderId}`);
+  };
+
+  // Distribution of orders by status for pie chart
+  const statusDistribution = useMemo(() => {
+    return [
+      { name: 'Pending', value: statsData.pendingOrders },
+      { name: 'In Transit', value: statsData.inTransitOrders },
+      { name: 'Delivered', value: statsData.deliveredOrders }
+    ].filter(item => item.value > 0);
+  }, [statsData]);
 
   if (loading) {
     return (
@@ -223,7 +325,7 @@ function Dashboard() {
 
       {error && <div className="form-error">{error}</div>}
 
-      {/* Stats Summary */}
+      {/* Stats Summary Cards */}
       <div className="stats-grid">
         <div className="stat-card stat-primary">
           <div className="stat-icon">
@@ -245,23 +347,8 @@ function Dashboard() {
             </svg>
           </div>
           <div className="stat-content">
-            <div className="stat-label">Pending Orders</div>
-            <div className="stat-value">{statsData.pendingOrders}</div>
-          </div>
-        </div>
-
-        <div className="stat-card stat-info">
-          <div className="stat-icon">
-            <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="1" y="3" width="15" height="13"></rect>
-              <polygon points="16 8 20 8 23 11 23 16 16 16 16 8"></polygon>
-              <circle cx="5.5" cy="18.5" r="2.5"></circle>
-              <circle cx="18.5" cy="18.5" r="2.5"></circle>
-            </svg>
-          </div>
-          <div className="stat-content">
-            <div className="stat-label">In Transit</div>
-            <div className="stat-value">{statsData.inTransitOrders}</div>
+            <div className="stat-label">Active Orders</div>
+            <div className="stat-value">{statsData.pendingOrders + statsData.inTransitOrders}</div>
           </div>
         </div>
 
@@ -275,6 +362,129 @@ function Dashboard() {
           <div className="stat-content">
             <div className="stat-label">Completed</div>
             <div className="stat-value">{statsData.deliveredOrders}</div>
+          </div>
+        </div>
+
+        <div className="stat-card stat-info">
+          <div className="stat-icon">
+            <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="12" y1="1" x2="12" y2="23"></line>
+              <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
+            </svg>
+          </div>
+          <div className="stat-content">
+            <div className="stat-label">Total Spent</div>
+            <div className="stat-value">₹{statsData.totalSpent}</div>
+            <div className="stat-subtitle">Avg. ₹{statsData.avgOrderValue} per order</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Data Visualization Section */}
+      <div className="dashboard-section">
+        <div className="section-header">
+          <h2 className="section-title">Delivery Analytics</h2>
+          <div className="tab-buttons">
+            <button 
+              onClick={() => setTimeframe('week')} 
+              className={`tab-button ${timeframe === 'week' ? 'active' : ''}`}
+            >
+              Week
+            </button>
+            <button 
+              onClick={() => setTimeframe('month')} 
+              className={`tab-button ${timeframe === 'month' ? 'active' : ''}`}
+            >
+              Month
+            </button>
+            <button 
+              onClick={() => setTimeframe('year')} 
+              className={`tab-button ${timeframe === 'year' ? 'active' : ''}`}
+            >
+              Year
+            </button>
+          </div>
+        </div>
+
+        <div className="analytics-grid">
+          {/* Spending Chart */}
+          <div className="analytics-card">
+            <h3 className="analytics-title">Spending Trends</h3>
+            <div className="chart-container" style={{ height: '250px' }}>
+              {spendingData.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart
+                    data={spendingData}
+                    margin={{ top: 5, right: 30, left: 20, bottom: 5 }}
+                  >
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis 
+                      dataKey="date" 
+                      tickFormatter={(value) => {
+                        if (timeframe === 'year') {
+                          return value.split('-')[1]; // Just show the month
+                        }
+                        return value.split('-').slice(1).join('-'); // Remove year
+                      }}
+                    />
+                    <YAxis />
+                    <Tooltip 
+                      formatter={(value) => [`₹${value}`, 'Amount']}
+                      labelFormatter={(label) => {
+                        if (timeframe === 'year') {
+                          const [year, month] = label.split('-');
+                          return `${new Date(year, month - 1).toLocaleString('default', { month: 'long' })} ${year}`;
+                        }
+                        return new Date(label).toLocaleDateString();
+                      }}
+                    />
+                    <Line 
+                      type="monotone" 
+                      dataKey="amount" 
+                      stroke="#4f46e5" 
+                      strokeWidth={2}
+                      activeDot={{ r: 8 }}
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="no-data-message">
+                  No spending data available for this time period
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Order Status Distribution */}
+          <div className="analytics-card">
+            <h3 className="analytics-title">Order Status</h3>
+            <div className="chart-container" style={{ height: '250px' }}>
+              {statusDistribution.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <PieChart>
+                    <Pie
+                      data={statusDistribution}
+                      cx="50%"
+                      cy="50%"
+                      innerRadius={60}
+                      outerRadius={80}
+                      paddingAngle={5}
+                      dataKey="value"
+                      label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
+                    >
+                      {statusDistribution.map((entry, index) => (
+                        <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                      ))}
+                    </Pie>
+                    <Tooltip formatter={(value) => [value, 'Orders']} />
+                  </PieChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="no-data-message">
+                  No order data available
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -302,6 +512,36 @@ function Dashboard() {
               orderStatus={selectedOrder.status}
             />
             
+            <div className="delivery-info-panel">
+              <div className="delivery-info-row">
+                <span className="delivery-info-label">Pickup:</span>
+                <span className="delivery-info-value">{selectedOrder.pickupAddress}</span>
+              </div>
+              <div className="delivery-info-row">
+                <span className="delivery-info-label">Delivery:</span>
+                <span className="delivery-info-value">{selectedOrder.deliveryAddress}</span>
+              </div>
+              <div className="delivery-info-row">
+                <span className="delivery-info-label">Recipient:</span>
+                <span className="delivery-info-value">{selectedOrder.recipientName} ({selectedOrder.recipientPhone})</span>
+              </div>
+              <div className="tracking-status-row">
+                <div className="tracking-steps">
+                  {['Order Placed', 'Assigned', 'In Transit', 'Delivered'].map((step, index) => (
+                    <div key={index} className={`tracking-step ${
+                      index === 0 ? 'completed' : 
+                      index === 1 && ['assigned', 'in-transit', 'delivered'].includes(selectedOrder.status) ? 'completed' :
+                      index === 2 && ['in-transit', 'delivered'].includes(selectedOrder.status) ? 'completed' :
+                      index === 3 && selectedOrder.status === 'delivered' ? 'completed' : ''
+                    }`}>
+                      <div className="tracking-step-dot"></div>
+                      <div className="tracking-step-label">{step}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            
             <div className="flex justify-center mt-4">
               <button
                 onClick={() => handleOrderClick(selectedOrder.id)}
@@ -314,18 +554,39 @@ function Dashboard() {
         </div>
       )}
 
-      {/* Active Orders */}
+      {/* Active Orders with Filtering */}
       <div className="dashboard-section">
         <div className="section-header">
           <h2 className="section-title">Active Orders</h2>
-          {activeOrders.length > 4 && (
-            <Link to="/orders" className="section-link">
-              View All
-              <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" className="ml-1">
-                <polyline points="9 18 15 12 9 6"></polyline>
+          
+          <div className="filter-controls">
+            <div className="search-container">
+              <input
+                type="text"
+                placeholder="Search orders..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="search-input"
+              />
+              <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" className="search-icon">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
               </svg>
-            </Link>
-          )}
+            </div>
+            
+            <div className="filter-container">
+              <select
+                value={filterStatus}
+                onChange={(e) => setFilterStatus(e.target.value)}
+                className="filter-select"
+              >
+                <option value="all">All Statuses</option>
+                <option value="pending">Pending</option>
+                <option value="assigned">Assigned</option>
+                <option value="in-transit">In Transit</option>
+              </select>
+            </div>
+          </div>
         </div>
 
         {activeOrders.length === 0 ? (
@@ -339,9 +600,21 @@ function Dashboard() {
             <p className="empty-state-description">You don't have any active deliveries at the moment.</p>
             <Link to="/create-order" className="btn">Create New Delivery</Link>
           </div>
+        ) : filteredOrders.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-state-icon">
+              <svg viewBox="0 0 24 24" width="48" height="48" stroke="currentColor" strokeWidth="1" fill="none" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+              </svg>
+            </div>
+            <h3 className="empty-state-title">No Matching Orders</h3>
+            <p className="empty-state-description">No orders match your current filters. Try adjusting your search.</p>
+            <button onClick={() => { setSearchQuery(''); setFilterStatus('all'); }} className="btn">Clear Filters</button>
+          </div>
         ) : (
           <div className="order-cards">
-            {activeOrders.map(order => (
+            {filteredOrders.map(order => (
               <div 
                 key={order.id} 
                 className={`order-card-compact ${selectedOrder && selectedOrder.id === order.id ? 'border-primary border-2' : ''}`}
@@ -487,16 +760,15 @@ function Dashboard() {
             <p className="quick-action-desc">Manage your account settings</p>
           </Link>
 
-          <Link to="#" className="quick-action-card">
+          <Link to="#" className="quick-action-card notification-badge">
             <div className="quick-action-icon">
               <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="10"></circle>
-                <line x1="12" y1="8" x2="12" y2="12"></line>
-                <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
+                <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
               </svg>
             </div>
-            <div className="quick-action-title">Help & Support</div>
-            <p className="quick-action-desc">Get assistance or report issues</p>
+            <div className="quick-action-title">Notifications</div>
+            <p className="quick-action-desc">Get updates on your deliveries</p>
           </Link>
         </div>
       </div>
