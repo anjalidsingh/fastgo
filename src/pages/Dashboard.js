@@ -12,6 +12,7 @@ import {
 import { db } from '../services/firebase';
 import { useAuth } from '../context/AuthContext';
 import LoadingSpinner from '../components/LoadingSpinner';
+import MapTracking from '../components/MapTracking'; // Import MapTracking component
 
 function Dashboard() {
   const [activeOrders, setActiveOrders] = useState([]);
@@ -24,6 +25,7 @@ function Dashboard() {
     totalSpent: 0,
     avgOrderValue: 0
   });
+  const [selectedOrder, setSelectedOrder] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const { currentUser } = useAuth();
@@ -55,6 +57,17 @@ function Dashboard() {
           });
         });
         setActiveOrders(ordersData);
+        
+        // Auto-select the first active order for tracking if no order is selected
+        if (ordersData.length > 0 && (!selectedOrder || !ordersData.find(order => order.id === selectedOrder.id))) {
+          const inTransitOrders = ordersData.filter(order => order.status === 'in-transit');
+          if (inTransitOrders.length > 0) {
+            setSelectedOrder(inTransitOrders[0]);
+          } else if (ordersData.length > 0) {
+            setSelectedOrder(ordersData[0]);
+          }
+        }
+        
         setLoading(false);
       },
       (error) => {
@@ -148,7 +161,12 @@ function Dashboard() {
     return () => {
       activeOrdersUnsubscribe();
     };
-  }, [currentUser]);
+  }, [currentUser, selectedOrder]);
+
+  // Handle selecting an order for detailed tracking
+  const handleSelectOrder = (order) => {
+    setSelectedOrder(order);
+  };
 
   const formatDate = (date) => {
     try {
@@ -261,6 +279,41 @@ function Dashboard() {
         </div>
       </div>
 
+      {/* Map Tracking for Selected Order */}
+      {selectedOrder && selectedOrder.status !== 'pending' && (
+        <div className="order-card mb-6">
+          <div className="order-header">
+            <h2 className="order-card-title">
+              <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" className="mr-2">
+                <polygon points="3 11 22 2 13 21 11 13 3 11"></polygon>
+              </svg>
+              Live Tracking - Order #{selectedOrder.id.substring(0, 8)}
+            </h2>
+            <div className={`status-pill ${getStatusClass(selectedOrder.status)}`}>
+              {selectedOrder.status ? capitalizeFirstLetter(selectedOrder.status) : 'Unknown'}
+            </div>
+          </div>
+          <div className="order-body">
+            <MapTracking
+              orderId={selectedOrder.id}
+              pickupAddress={selectedOrder.pickupAddress}
+              deliveryAddress={selectedOrder.deliveryAddress}
+              partnerInfo={selectedOrder.partnerId ? { name: 'Delivery Partner' } : null}
+              orderStatus={selectedOrder.status}
+            />
+            
+            <div className="flex justify-center mt-4">
+              <button
+                onClick={() => handleOrderClick(selectedOrder.id)}
+                className="btn"
+              >
+                View Order Details
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Active Orders */}
       <div className="dashboard-section">
         <div className="section-header">
@@ -291,8 +344,8 @@ function Dashboard() {
             {activeOrders.map(order => (
               <div 
                 key={order.id} 
-                className="order-card-compact" 
-                onClick={() => handleOrderClick(order.id)}
+                className={`order-card-compact ${selectedOrder && selectedOrder.id === order.id ? 'border-primary border-2' : ''}`}
+                onClick={() => handleSelectOrder(order)}
               >
                 <div className="order-card-header">
                   <div className="order-card-title">Order #{order.id.substring(0, 8)}</div>
@@ -323,7 +376,11 @@ function Dashboard() {
                     <span className="package-badge">{order.packageSize || 'N/A'}</span>
                     <span>{order.packageWeight || 0} kg</span>
                   </div>
-                  <button className="btn-sm btn-outline">View Details</button>
+                  {selectedOrder && selectedOrder.id === order.id ? (
+                    <button className="btn-sm">Selected</button>
+                  ) : (
+                    <button className="btn-sm btn-outline">Track</button>
+                  )}
                 </div>
               </div>
             ))}

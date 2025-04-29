@@ -33,14 +33,13 @@ export const calculateDistance = (lat1, lon1, lat2, lon2) => {
     return [randomLat, randomLng];
   };
   
-  // Geocode an address to get lat/lng (for a real app, you'd use a geocoding service)
-  // This mock version will generate random positions for demonstration
+  // Geocode an address to get lat/lng (in a real app, you'd use a geocoding service)
+  // This mock version will generate random positions around major Indian cities
   export const geocodeAddress = (address) => {
     // In a real app, you would call a geocoding API like Google Maps or Mapbox
-    // For now, we'll generate random coordinates in India
     return new Promise((resolve) => {
       setTimeout(() => {
-        // Return random coordinates around central India for mock purposes
+        // Base coordinates for major Indian cities
         const baseCoords = {
           "Delhi": [28.7041, 77.1025],
           "Mumbai": [19.0760, 72.8777],
@@ -61,14 +60,14 @@ export const calculateDistance = (lat1, lon1, lat2, lon2) => {
           }
         }
         
-        // Slightly randomize the coordinates
+        // Slightly randomize the coordinates for more realistic simulation
         const coords = generateRandomPosition(baseCoord[0], baseCoord[1], 5);
         resolve(coords);
-      }, 300);
+      }, 300); // Simulate network delay
     });
   };
   
-  // Get current user position
+  // Get current user position (browser geolocation)
   export const getCurrentPosition = () => {
     return new Promise((resolve, reject) => {
       if (navigator.geolocation) {
@@ -80,7 +79,8 @@ export const calculateDistance = (lat1, lon1, lat2, lon2) => {
             console.error('Geolocation error:', error);
             // Fallback to a default location (central India)
             resolve([20.5937, 78.9629]);
-          }
+          },
+          { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
         );
       } else {
         console.error('Geolocation is not supported by this browser');
@@ -137,24 +137,34 @@ export const calculateDistance = (lat1, lon1, lat2, lon2) => {
     return timeInMinutes;
   };
   
-  // Generate a route between two points (in a real app, you'd use a routing service)
-  export const generateMockRoute = (startLat, startLng, endLat, endLng, numPoints = 5) => {
+  // Generate a route between two points with realistic waypoints
+  export const generateMockRoute = (startLat, startLng, endLat, endLng, numPoints = 10) => {
     const route = [];
     
     // Add start point
     route.push([startLat, startLng]);
     
+    // Calculate the direct distance
+    const directDistance = calculateDistance(startLat, startLng, endLat, endLng);
+    
+    // Calculate maximum deviation based on direct distance (more deviation for longer routes)
+    const maxDeviation = Math.min(0.01, directDistance * 0.005); // Limit maximum deviation
+    
     // Generate intermediate points
     for (let i = 1; i < numPoints - 1; i++) {
-      const ratio = i / numPoints;
+      const ratio = i / (numPoints - 1);
+      
+      // Basic linear interpolation
       const lat = startLat + ratio * (endLat - startLat);
       const lng = startLng + ratio * (endLng - startLng);
       
-      // Add some random variation to make it look like a real route
-      const jitterLat = (Math.random() - 0.5) * 0.01;
-      const jitterLng = (Math.random() - 0.5) * 0.01;
+      // Add some random variation to make the route more realistic
+      // More deviation in the middle, less at the ends
+      const deviationFactor = Math.sin(ratio * Math.PI); // 0 at ends, 1 in middle
+      const latJitter = (Math.random() - 0.5) * 2 * maxDeviation * deviationFactor;
+      const lngJitter = (Math.random() - 0.5) * 2 * maxDeviation * deviationFactor;
       
-      route.push([lat + jitterLat, lng + jitterLng]);
+      route.push([lat + latJitter, lng + lngJitter]);
     }
     
     // Add end point
@@ -165,6 +175,7 @@ export const calculateDistance = (lat1, lon1, lat2, lon2) => {
   
   // Calculate zoom level based on distance
   export const calculateZoomLevel = (distanceKm) => {
+    if (distanceKm < 1) return 16;
     if (distanceKm < 2) return 15;
     if (distanceKm < 5) return 14;
     if (distanceKm < 10) return 13;
@@ -172,5 +183,7 @@ export const calculateDistance = (lat1, lon1, lat2, lon2) => {
     if (distanceKm < 50) return 11;
     if (distanceKm < 100) return 10;
     if (distanceKm < 200) return 9;
-    return 8;
+    if (distanceKm < 500) return 8;
+    if (distanceKm < 1000) return 7;
+    return 6;
   };

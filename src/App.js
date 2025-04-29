@@ -7,13 +7,16 @@ import Header from './components/Header';
 import Footer from './components/Footer';
 import PrivateRoute from './components/PrivateRoute';
 import LoadingSpinner from './components/LoadingSpinner';
-import ErrorBoundary from './components/ErrorBoundary'; // New error boundary component
+import ErrorBoundary from './components/ErrorBoundary';
 
 // Eagerly loaded pages - critical for initial load
 import Home from './pages/Home';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import './styles/main.css';
+
+// Import Map stylesheet (Leaflet CSS)
+import 'leaflet/dist/leaflet.css';
 
 // Lazy loaded pages for better performance
 const Dashboard = lazy(() => import(/* webpackChunkName: "dashboard" */ './pages/Dashboard'));

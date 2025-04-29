@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { db } from '../services/firebase';
@@ -12,7 +12,9 @@ import {
   orderBy, 
   limit 
 } from 'firebase/firestore';
-import PaymentMethod from '../components/PaymentMethod'; // Import the payment component
+import PaymentMethod from '../components/PaymentMethod';
+import { geocodeAddress } from '../services/mapService';
+import LoadingSpinner from '../components/LoadingSpinner';
 
 function CreateOrder() {
   // Basic order details
@@ -49,14 +51,137 @@ function CreateOrder() {
   const [expressCharge, setExpressCharge] = useState(0);
   const [step, setStep] = useState(1); // For multi-step form
   
+  // Map state
+  const [mapInitialized, setMapInitialized] = useState(false);
+  const [pickupCoords, setPickupCoords] = useState(null);
+  const [deliveryCoords, setDeliveryCoords] = useState(null);
+  const [mapDistance, setMapDistance] = useState(null);
+  const [addressSearchLoading, setAddressSearchLoading] = useState({
+    pickup: false,
+    delivery: false
+  });
+  
   const { currentUser } = useAuth();
   const navigate = useNavigate();
+  const mapContainerRef = useRef(null);
+  const mapInstanceRef = useRef(null);
+  const markersLayerRef = useRef(null);
+  const polylineLayerRef = useRef(null);
   
   // Generate OTP for delivery verification
   const generateOTP = () => {
     // Generate a 6-digit OTP
     return Math.floor(100000 + Math.random() * 900000).toString();
   };
+  
+  // Initialize map
+  useEffect(() => {
+    if (!mapContainerRef.current || typeof window.L === 'undefined' || mapInitialized) return;
+    
+    try {
+      const L = window.L;
+      
+      // Fix Leaflet icon issues
+      delete L.Icon.Default.prototype._getIconUrl;
+      L.Icon.Default.mergeOptions({
+        iconRetinaUrl: 'https://unpkg.com/leaflet@1.7.1/dist/images/marker-icon-2x.png',
+        iconUrl: 'https://unpkg.com/leaflet@1.7.1/dist/images/marker-icon.png',
+        shadowUrl: 'https://unpkg.com/leaflet@1.7.1/dist/images/marker-shadow.png',
+      });
+      
+      // Create map centered on India
+      const map = L.map(mapContainerRef.current).setView([20.5937, 78.9629], 5);
+      
+      // Add OpenStreetMap tile layer
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        maxZoom: 19,
+      }).addTo(map);
+      
+      // Create layers for markers and route
+      markersLayerRef.current = L.layerGroup().addTo(map);
+      polylineLayerRef.current = L.layerGroup().addTo(map);
+      
+      mapInstanceRef.current = map;
+      setMapInitialized(true);
+      
+      // Resize the map after a short delay to ensure proper rendering
+      setTimeout(() => {
+        if (mapInstanceRef.current) {
+          mapInstanceRef.current.invalidateSize();
+        }
+      }, 500);
+    } catch (err) {
+      console.error("Error initializing map:", err);
+    }
+    
+    // Clean up on unmount
+    return () => {
+      if (mapInstanceRef.current) {
+        mapInstanceRef.current.remove();
+        mapInstanceRef.current = null;
+      }
+    };
+  }, [mapInitialized]);
+  
+  // Update map when addresses change
+  useEffect(() => {
+    if (!mapInitialized) return;
+    
+    const updateMap = async () => {
+      if (!pickupAddress && !deliveryAddress) return;
+      
+      // Clear existing markers and route
+      if (markersLayerRef.current) markersLayerRef.current.clearLayers();
+      if (polylineLayerRef.current) polylineLayerRef.current.clearLayers();
+      
+      const L = window.L;
+      
+      // Add pickup marker if we have coordinates
+      if (pickupCoords) {
+        L.marker(pickupCoords)
+          .bindPopup(`<b>Pickup:</b><br>${pickupAddress}`)
+          .addTo(markersLayerRef.current);
+      }
+      
+      // Add delivery marker if we have coordinates
+      if (deliveryCoords) {
+        L.marker(deliveryCoords)
+          .bindPopup(`<b>Delivery:</b><br>${deliveryAddress}`)
+          .addTo(markersLayerRef.current);
+      }
+      
+      // If we have both markers, draw a line and fit the map
+      if (pickupCoords && deliveryCoords) {
+        // Create a simple route (straight line)
+        L.polyline([pickupCoords, deliveryCoords], {
+          color: '#4f46e5',
+          weight: 4,
+          dashArray: '10, 10'
+        }).addTo(polylineLayerRef.current);
+        
+        // Fit map to show both markers
+        const bounds = L.latLngBounds([pickupCoords, deliveryCoords]);
+        mapInstanceRef.current.fitBounds(bounds, { padding: [50, 50] });
+        
+        // Calculate distance
+        const distance = calculateDistance(
+          pickupCoords[0], pickupCoords[1],
+          deliveryCoords[0], deliveryCoords[1]
+        );
+        setMapDistance(distance);
+      } 
+      // If we only have one marker, center on it
+      else if (pickupCoords) {
+        mapInstanceRef.current.setView(pickupCoords, 13);
+      } 
+      else if (deliveryCoords) {
+        mapInstanceRef.current.setView(deliveryCoords, 13);
+      }
+    };
+    
+    updateMap();
+  }, [pickupCoords, deliveryCoords, pickupAddress, deliveryAddress, mapInitialized]);
   
   // Fetch recent addresses
   useEffect(() => {
@@ -95,16 +220,73 @@ function CreateOrder() {
     }
   }, [currentUser]);
   
-  // Calculate distance between two addresses (mock implementation)
-  const calculateDistance = (pickup, delivery) => {
-    // In a real app, you would use a maps API to calculate real distance
-    // This is just a simple mock implementation
+  // Geocode pickup address and update map
+  const geocodePickupAddress = async () => {
+    if (!pickupAddress.trim()) return;
     
-    // Generate a random distance between 2 and 15 km
-    return Math.floor(Math.random() * 13) + 2;
+    try {
+      setAddressSearchLoading(prev => ({ ...prev, pickup: true }));
+      const coords = await geocodeAddress(pickupAddress);
+      setPickupCoords(coords);
+      setAddressSearchLoading(prev => ({ ...prev, pickup: false }));
+    } catch (error) {
+      console.error('Error geocoding pickup address:', error);
+      setAddressSearchLoading(prev => ({ ...prev, pickup: false }));
+    }
   };
   
-  // Calculate price based on package details
+  // Geocode delivery address and update map
+  const geocodeDeliveryAddress = async () => {
+    if (!deliveryAddress.trim()) return;
+    
+    try {
+      setAddressSearchLoading(prev => ({ ...prev, delivery: true }));
+      const coords = await geocodeAddress(deliveryAddress);
+      setDeliveryCoords(coords);
+      setAddressSearchLoading(prev => ({ ...prev, delivery: false }));
+    } catch (error) {
+      console.error('Error geocoding delivery address:', error);
+      setAddressSearchLoading(prev => ({ ...prev, delivery: false }));
+    }
+  };
+  
+  // Calculate distance between two points in kilometers using the Haversine formula
+  const calculateDistance = (lat1, lon1, lat2, lon2) => {
+    const R = 6371; // Radius of the earth in km
+    const dLat = deg2rad(lat2 - lat1);
+    const dLon = deg2rad(lon2 - lon1); 
+    const a = 
+      Math.sin(dLat/2) * Math.sin(dLat/2) +
+      Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * 
+      Math.sin(dLon/2) * Math.sin(dLon/2); 
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)); 
+    const distance = R * c; // Distance in km
+    return parseFloat(distance.toFixed(2));
+  };
+  
+  // Helper function to convert degrees to radians
+  const deg2rad = (deg) => {
+    return deg * (Math.PI/180);
+  };
+  
+  // Handle selecting a recent address
+  const handleSelectRecentAddress = (e) => {
+    const selectedId = e.target.value;
+    setSelectedRecentAddress(selectedId);
+    
+    if (selectedId) {
+      const selected = recentAddresses.find(addr => addr.id === selectedId);
+      if (selected) {
+        setDeliveryAddress(selected.address);
+        setRecipientName(selected.recipientName);
+        setRecipientPhone(selected.recipientPhone);
+        // Trigger geocoding for the selected address
+        setTimeout(() => geocodeDeliveryAddress(), 300);
+      }
+    }
+  };
+  
+  // Calculate price based on package details and map distance
   const calculatePrice = () => {
     // Base price by size
     let basePrice;
@@ -128,11 +310,13 @@ function CreateOrder() {
     const weightPrice = weightFactor * 10;
     setWeightCharge(weightPrice);
     
-    // Distance charge (if addresses are provided)
+    // Distance charge (if coordinates are available)
     let distancePrice = 0;
-    if (pickupAddress && deliveryAddress) {
-      const distance = calculateDistance(pickupAddress, deliveryAddress);
-      distancePrice = distance * 5; // ₹5 per km
+    if (mapDistance) {
+      distancePrice = mapDistance * 5; // ₹5 per km
+    } else if (pickupAddress && deliveryAddress) {
+      // Fallback to estimate if no map distance available
+      distancePrice = 50; // Default distance charge
     }
     setDistanceCharge(distancePrice);
     
@@ -161,7 +345,7 @@ function CreateOrder() {
     return Math.ceil(finalPrice);
   };
   
-  // Update price when form values change
+  // Update price when form values or map distance changes
   useEffect(() => {
     setPrice(calculatePrice());
   }, [
@@ -172,24 +356,10 @@ function CreateOrder() {
     isExpress,
     isFoodDelivery,
     needReturnDelivery,
-    isScheduledDelivery
+    isScheduledDelivery,
+    mapDistance
   ]);
   
-  // Handle selecting a recent address
-  const handleSelectRecentAddress = (e) => {
-    const selectedId = e.target.value;
-    setSelectedRecentAddress(selectedId);
-    
-    if (selectedId) {
-      const selected = recentAddresses.find(addr => addr.id === selectedId);
-      if (selected) {
-        setDeliveryAddress(selected.address);
-        setRecipientName(selected.recipientName);
-        setRecipientPhone(selected.recipientPhone);
-      }
-    }
-  };
-
   const validateForm = () => {
     // Basic validation
     if (!pickupAddress.trim()) {
@@ -278,6 +448,8 @@ function CreateOrder() {
         customerId: currentUser.uid,
         pickupAddress,
         deliveryAddress,
+        pickupCoords: pickupCoords || null,
+        deliveryCoords: deliveryCoords || null,
         packageSize,
         packageWeight: parseFloat(packageWeight) || 0,
         packageDescription,
@@ -385,14 +557,29 @@ function CreateOrder() {
           <div className="form-step">
             <div className="form-group">
               <label className="form-label">Pickup Address</label>
-              <textarea
-                value={pickupAddress}
-                onChange={(e) => setPickupAddress(e.target.value)}
-                className="form-textarea"
-                rows="2"
-                placeholder="Enter the full pickup address"
-                required
-              ></textarea>
+              <div className="form-input-group">
+                <textarea
+                  value={pickupAddress}
+                  onChange={(e) => setPickupAddress(e.target.value)}
+                  onBlur={geocodePickupAddress}
+                  className="form-textarea"
+                  rows="2"
+                  placeholder="Enter the full pickup address"
+                  required
+                ></textarea>
+                <button 
+                  type="button"
+                  className="btn-sm ml-2"
+                  onClick={geocodePickupAddress}
+                  disabled={addressSearchLoading.pickup || !pickupAddress}
+                >
+                  {addressSearchLoading.pickup ? (
+                    <LoadingSpinner size="small" />
+                  ) : (
+                    <span>Verify</span>
+                  )}
+                </button>
+              </div>
             </div>
             
             <div className="form-group">
@@ -428,15 +615,59 @@ function CreateOrder() {
                   </select>
                 </div>
               ) : (
-                <textarea
-                  value={deliveryAddress}
-                  onChange={(e) => setDeliveryAddress(e.target.value)}
-                  className="form-textarea"
-                  rows="2"
-                  placeholder="Enter the full delivery address"
-                  required
-                ></textarea>
+                <div className="form-input-group">
+                  <textarea
+                    value={deliveryAddress}
+                    onChange={(e) => setDeliveryAddress(e.target.value)}
+                    onBlur={geocodeDeliveryAddress}
+                    className="form-textarea"
+                    rows="2"
+                    placeholder="Enter the full delivery address"
+                    required
+                  ></textarea>
+                  <button 
+                    type="button"
+                    className="btn-sm ml-2"
+                    onClick={geocodeDeliveryAddress}
+                    disabled={addressSearchLoading.delivery || !deliveryAddress}
+                  >
+                    {addressSearchLoading.delivery ? (
+                      <LoadingSpinner size="small" />
+                    ) : (
+                      <span>Verify</span>
+                    )}
+                  </button>
+                </div>
               )}
+            </div>
+            
+            {/* Map display for addresses */}
+            <div className="map-container-wrapper mt-4">
+              <h3 className="text-lg font-semibold mb-2">Delivery Route Preview</h3>
+              {/* Map container with explicit height to ensure visibility */}
+              <div 
+                ref={mapContainerRef} 
+                className="map-container" 
+                style={{ height: "300px", width: "100%" }}
+              ></div>
+              
+              {/* Display distance if available */}
+              {mapDistance && (
+                <div className="mt-2 text-sm text-gray-600">
+                  <strong>Estimated Distance:</strong> {mapDistance} km
+                </div>
+              )}
+              
+              <div className="flex flex-col sm:flex-row mt-2 justify-between">
+                <div className="flex items-center mb-2 sm:mb-0">
+                  <div className="w-3 h-3 rounded-full bg-blue-500 mr-2"></div>
+                  <span className="text-sm text-gray-600">Pickup Location</span>
+                </div>
+                <div className="flex items-center">
+                  <div className="w-3 h-3 rounded-full bg-green-500 mr-2"></div>
+                  <span className="text-sm text-gray-600">Delivery Location</span>
+                </div>
+              </div>
             </div>
             
             <div className="form-navigation">
@@ -735,7 +966,7 @@ function CreateOrder() {
               </div>
               {distanceCharge > 0 && (
                 <div className="payment-summary-row">
-                  <span>Distance Charge:</span>
+                  <span>Distance Charge ({mapDistance ? `${mapDistance} km` : 'estimated'}):</span>
                   <span>₹{distanceCharge}</span>
                 </div>
               )}
